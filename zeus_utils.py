@@ -8,14 +8,12 @@ def add_ord_loc(orders_sum,customers):
     return ord
 
 def fill_trucks_customer(orders, trucks, wh_cap=25):
-    # These are all orders for one customer and one date. Truck should be filled one by one until all are packed or until there are no more trucks or until warehouse capacity is reached. Return orders that are not packed, trucks that are not filled and booked orders.
+    # These are all orders for one customer or location. Truck should be filled one by one until all are packed or until there are no more trucks or until warehouse capacity is reached. Return orders that are not packed, trucks that are not filled and booked orders.
     # Sort orders by volume
     orders = orders.sort_values('Total Volume',ascending=False)
+    # Start filling from cheapest truck
     trucks = trucks.sort_values('price')
-    # How to sort trucks?
     cur_o = 0
-    cur_t = 0
-    # Da li ici po kamionu ili po narudzbini?
     # Verovatno treba imati i podatak o narudzbinama u kamionu, isto tako i u tome kojim sve kamionima ide neka veca narudzbina, i da li je cela poslata itd.
     booked_t = []#{'truck':h_id, 'status':'part-full','orders':[{o_id:o_vol}]}]
     booked_o = []#{'order':o_id, 'truck':h_id, 'volume':o_vol}]
@@ -84,8 +82,11 @@ def fill_trucks_customer(orders, trucks, wh_cap=25):
             booked_t.append(t)
             wh_cap-=1
             for t_o in t['orders']:
-                    booked_o.append({'order':t_o.keys()[0], 'truck':h_id,
-                                     'volume':t_o.values()[0]})
+                # for each order in the truck
+                t_o_id = list(t_o.keys())[0]
+                t_o_v = t_o.values()[0]
+                booked_o.append({'order':t_o_id, 'truck':h_id,
+                                     'volume':})
         else:
             # this truck is not full, which means that there are no more orders
             break

@@ -49,7 +49,7 @@ fuelSurchargePercent = 6.14
 
 def wh_pack_orders(wh_id, orders):
     # Work per warehouse, maybe later see if we can combine orders from multiple warehouses into one truck (if they are close enough)
-    # wh_id = '5HU5'
+    # wh_id = '5HU2'
     ord = orders
     wh = whs[whs['Shipping point \n(Primary key for mapping of loads from OTM)'] == wh_id]
     wh_ord = ord[ord['Shipping Point']==wh_id]
@@ -65,6 +65,7 @@ def wh_pack_orders(wh_id, orders):
     b_ord = [] # Booked orders
     b_truck = [] # Booked trucks
     ord_backlog = []
+    cuopt_ords = []
     # Traverse dates
     for d in dates:
         print(d)
@@ -80,6 +81,9 @@ def wh_pack_orders(wh_id, orders):
         # Doda se odmah i lokacija, posle se iz d_ord samo uzimaju podaci, na osnovu razlicitih grupisanja
         d_ord = add_ord_loc(d_ord,cust)
         d_ord['loc'] = d_ord['party_country']+'-'+d_ord['party_zipcode'].str[:2]
+        # Merge backlog with new orders
+        d_ord = pd.concat([d_ord] + ord_backlog)
+        ord_backlog = []
         #--------# Group by customer
         d_ord_sum = d_ord.groupby(['Ship to Party']).agg({'Gross total weight':sum,'Total Volume':sum,'Balance Order Quantity':sum}) # ,'SKU Code']
         # Big enough orders for the day, that can fill at least one truck
@@ -90,25 +94,28 @@ def wh_pack_orders(wh_id, orders):
         orders_left = []
         #################################
         if not d_ord_xl.empty:
+            print('Big orders for one or more customers')
             # there are big orders for one or more customers
             d_ord_xl = d_ord_xl.sort_values('Total Volume',ascending=False)
             # For each customer book trucks
             for c in d_ord_xl.index.get_level_values(0).unique():
+                # Get orders for this customer
+                d_ord_c = d_ord[d_ord['Ship to Party']==c]
                 if wh_cap==0:
                     # If no more wh capacity
                     print('No more wh capacity')
                     not_more_capacity = True #TODO: Check
-                    orders_left.append(c)
+                    orders_left.append(d_ord_c)
                     continue
-                # Get today orders for this customer
-                d_ord_c = d_ord[d_ord['Ship to Party']==c]
                 # Pull wh_hauliers for this customer and start filling
-                haul_loc=d_ord_c.iloc[0]['loc']
-                c_haul = wh_haul[wh_haul['regionCodeTo']==haul_loc]
+                haul_loc=d_ord_c.iloc[0]['loc'].upper()
+                c_haul = wh_haul_a[wh_haul_a['regionCodeTo']==haul_loc]
+                print(haul_loc)
+                print(c_haul)
                 if c_haul.empty:
                     # If no hauliers for this customer, add to backlog
                     print('No hauliers for this customer')
-                    orders_left.append(c)
+                    orders_left.append(d_ord_c)
                     continue
                 c_haul = c_haul.sort_values('price')
                 # Book orders, and return booked orders and trucks, and left orders and trucks, split orders and warehouse capacity
@@ -120,21 +127,20 @@ def wh_pack_orders(wh_id, orders):
                 wh_haul_a = wh_haul_a[~wh_haul_a['contractNumber'].isin(booked_h)]
                 wh_haul.loc[wh_haul['contractNumber'].isin(booked_h),'available'] = False
                 wh_haul.loc[wh_haul['contractNumber'].isin(booked_h),'availableFrom'] = d + pd.Timedelta(days=5)
-                print(wh_haul['availableFrom'])
                 # TODO: Add return date for each haulier
                 # If there are unbooked orders, add them to backlog
                 if d_ord_rem_o:
                     orders_left.append(d_ord_rem_o)
+        #--------# Merge xl ord leftovers and small orders from c grouping
+        orders_left = orders_left + [ord_sml]
         if wh_cap==0:
             # If no more wh capacity
             print('No more wh capacity')
-            ord_backlog = ord_backlog + orders_left
-            ord_backlog.append(ord_sml)
+            ord_backlog = orders_left
             continue
-        #--------# Merge xl ord leftovers and small orders from c grouping
-        d_ord_left = pd.concat(orders_left + [ord_sml])
-        orders_left = []
-        # Group by country and city to try and fill truck for city
+        #--------# Group by location (country and city)
+        d_ord_left = pd.concat(orders_left)
+        orders_left = [] # Reset orders_left
         d_ord_left_sum = d_ord_left.groupby(['loc']).agg({'Gross total weight':sum,'Total Volume':sum,'Balance Order Quantity':sum})
         d_ord_left_sum = d_ord_left_sum.sort_values('Balance Order Quantity',ascending=False)
         d_ord_left_sum_xl= d_ord_left_sum[d_ord_left_sum['Balance Order Quantity']>=min_qty]
@@ -144,6 +150,7 @@ def wh_pack_orders(wh_id, orders):
             # If the largest order is smaller than one truck, add to backlog
             orders_left.append(d_ord_left)
         else:
+            print('Big orders for one or more locations')
             # For each location book trucks
             for l in d_ord_left_sum_xl.index.get_level_values(0).unique():
                 # Separate orders for this location
@@ -154,8 +161,9 @@ def wh_pack_orders(wh_id, orders):
                     orders_left.append(d_ord_left_xl_l)
                     continue
                 # Pull wh_hauliers for this location by desitnation, and start filling trucks from lowest price
-                l_haul = wh_haul[wh_haul['regionCodeTo']==l]
+                l_haul = wh_haul[wh_haul['regionCodeTo']==l.upper()]
                 if l_haul.empty:
+                    print('No hauliers for this location')
                     # If no hauliers for this location, add to backlog
                     orders_left.append(d_ord_left_xl_l)
                     continue
@@ -172,61 +180,53 @@ def wh_pack_orders(wh_id, orders):
                 # If there are split orders and unbooked orders, add them to backlog
                 if d_ord_rem_o:
                     orders_left.append(d_ord_rem_o)
-            #------# Merge xl ord leftovers and small orders from loc grouping
-            orders_left = orders_left + [d_ord_left_small]
+        #------# Merge xl ord leftovers and small orders from loc grouping
+        orders_left = orders_left + [d_ord_left_small]
         if wh_cap==0:
             # If no more wh capacity
             print('No more wh capacity')
-            ord_backlog = ord_backlog + orders_left
+            ord_backlog = orders_left
             continue
-        #--------# After all possible is booked for this day, try with backlog
-        ord_backlog_new = []
-        ord_old = pd.concat(ord_backlog + orders_left)
-        ord_old.reset_index(inplace=True, drop=True)
-        # ord_old['Balance Order Quantity'].sum()
+        #--------# Country grouping
+        ord_cntry = pd.concat(orders_left)
+        ord_cntry.reset_index(inplace=True, drop=True)
         # Group by country and city to try and fill truck for city
-        ord_old_sum = ord_old.groupby(['loc']).agg({'Gross total weight':sum,'Total Volume':sum,'Balance Order Quantity':sum})
-        ord_old_sum= ord_old_sum.sort_values('Total Volume',ascending=False)
+        ord_cntry_sum = ord_cntry.groupby(['party_country']).agg({'Gross total weight':sum,'Total Volume':sum,'Balance Order Quantity':sum})
+        ord_cntry_sum.sort_values('Total Volume',ascending=False, inplace=True)
         #################### OGI##########
         ########## OVDE STAVI ISTO KAO GORE, ONO STO OSTANE IDE PO COUTRY
         # Continue with the same logic as above, for full trucks or >900
-        ord_old_sum_xl= ord_old_sum[ord_old_sum['Balance Order Quantity']>=min_qty]
-        ord_old_sum_sml= ord_old_sum[ord_old_sum['Balance Order Quantity']<min_qty]
-        ord_old_small = ord_old[ord_old['loc'].isin(ord_old_sum_sml.index)]
-        if not ord_old_sum_xl.empty:
-            for l in ord_old_sum_xl.index:
+        ord_cntry_sum_xl= ord_cntry_sum[ord_cntry_sum['Balance Order Quantity']>=min_qty]
+        ord_cntry_sum_sml= ord_cntry_sum[ord_cntry_sum['Balance Order Quantity']<min_qty]
+        ord_cntry_sum_small = ord_cntry[ord_cntry['party_country'].isin(ord_cntry_sum_sml.index)]
+        ord_backlog.append(ord_cntry_sum_small)
+        if not ord_cntry_sum_xl.empty:
+            print('Big orders for one or more countries')
+            for cnt in ord_cntry_sum_xl.index:
+                ord_cntry_cnt = ord_cntry[ord_cntry['party_country']==cnt]
                 if wh_cap==0:
                     # If no more wh capacity
-                    ord_backlog_new.append(ord_old_sum_xl.loc[l])
+                    ord_backlog.append(ord_cntry_cnt)
                     continue
-                # Separate summed orders for this location
-                ord_old_l = ord_old[ord_old['loc']==l]
-                # Pull wh_hauliers for this location by desitnation, and start filling trucks from lowest price
-                l_haul = wh_haul_a[wh_haul_a['regionCodeTo']==l]
-                if l_haul.empty:
+                # Pull wh_hauliers for this country
+                cnt_haul = wh_haul_a[wh_haul_a['countryTo']==cnt.upper()]
+                if cnt_haul.empty:
+                    print('No hauliers for this country')
                     # If no hauliers for this location, add to backlog
-                    ord_backlog_new.append(ord_old_l)
+                    ord_backlog.append(ord_cntry_cnt)
                     continue
-                l_haul = l_haul.sort_values('price')
-                # Book orders, and return booked orders and trucks, and left orders and trucks, split orders and warehouse capacity
-                d_ord_t, d_ord_b, d_ord_rem_o, wh_cap = fill_trucks_customer(ord_old_l, l_haul, wh_cap)
-                b_ord+=d_ord_b
-                b_truck+=d_ord_t
-                # Remove booked hauliers from available hauliers
-                booked_h = [t['truck'] for t in d_ord_t]
-                wh_haul_a = wh_haul_a[~wh_haul_a['contractNumber'].isin(booked_h)]
-                wh_haul.loc[wh_haul['contractNumber'].isin(booked_h),'available'] = False
-                wh_haul.loc[wh_haul['contractNumber'].isin(booked_h),'availableFrom'] = d + pd.Timedelta(days=5)
-                print(wh_haul['availableFrom'])
-                # If there are split orders and unbooked orders, add them to backlog
-                if d_ord_rem_o:
-                    ord_backlog_new.append(d_ord_rem_o)
-        # Now all that is left are small orders and ord_backlog_new
-        ord_backlog = ord_backlog_new + [ord_old_small]
-        ord_cuopt = pd.concat(ord_backlog)
+                cnt_haul = cnt_haul.sort_values('price')
+                ord_cuopt = ord_cntry_cnt
+                cuopt_ords.append(ord_cuopt)
+        # OVDE SAD IDE PROVERA ZA ORDERE KOJI SU PRED ISTEK
+
+        
         # After all that is possible is booked for this day, if there is still wh capacity, agg by country and try cuOpt
         # Sanity check
         wh_ord['Balance Order Quantity'].sum()
+        b_ord  # Booked orders
+        b_truck
+        ord_backlog
         ord_cuopt['Balance Order Quantity'].sum()
         ###############################################
         # for o in ord_backlog:
