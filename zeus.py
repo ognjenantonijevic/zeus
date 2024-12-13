@@ -1,6 +1,7 @@
 import sys
 
 import pandas as pd
+pd.options.mode.copy_on_write = True
 
 sys.path.append('/home/ogi/01_Projekti/ZEUS/code')
 from zeus_utils import add_ord_loc, fill_trucks_customer
@@ -57,16 +58,18 @@ def wh_pack_orders(wh_id, orders):
     # wh_id = '5HU2'
     ord = orders
     wh = whs[whs['Shipping point \n(Primary key for mapping of loads from OTM)'] == wh_id]
-    wh_ord = ord[ord['Shipping Point']==wh_id]
     # wh_ord['Balance Order Quantity'].sum()
     wh_city = wh['City'].values[0]
     wh_dep_t = 12 # departure time, HARD CODED FOR NOW
     wh_haul = hauls[(hauls['Shipping Point'] == wh_id)] 
     # Get order availability dates
+    wh_ord = ord[ord['Shipping Point']==wh_id]
     dates = wh_ord['MAD'].dt.date.unique()
     dates.sort()
-    # Gledaju se prvo narudzbine velike za istu musteriju (>1000), pa onda preostale u istom gradu, pa onda ako ne moze u roku od 7 dana on MADa, onda moze i ista zemlja. Ako nista od toga, i ako je narudzbina manja od 400, onda se brise.
-    wh_haul['availableFrom'] = dates[0]
+    d_range = pd.date_range(dates[0],dates[-1]+pd.Timedelta(days=1),freq='D')
+    wh_haul['availableFrom'] = pd.Timestamp(dates[0])
+
+    unb_ord = wh_ord.copy(deep=True)
     b_ord = [] # Booked orders
     b_truck = [] # Booked trucks
     ord_backlog = []
@@ -74,24 +77,31 @@ def wh_pack_orders(wh_id, orders):
     dropped = []
     # Traverse dates
     d_i = -1
-    for d in dates:
+    for d in d_range:
+        # Gledaju se prvo narudzbine velike za istu musteriju (>1000), pa onda preostale u istom gradu, pa onda ako ne moze u roku od 7 dana on MADa, onda moze i ista zemlja. Ako nista od toga, i ako je narudzbina manja od 400, onda se brise ( jos ovo nije implementirano!).
         d_i+=1
         print(d)
         tday = pd.Timestamp(d)
+        yday = tday - pd.Timedelta(days=1)
         # See if any of the hauliers returned
-        wh_haul.loc[:,'available'] = wh_haul['availableFrom'] <= d # TODO: Check
+        wh_haul.loc[:,'available'] = wh_haul['availableFrom'] <= tday # TODO: Check
         wh_haul_a = wh_haul[wh_haul['available']]
+        print(wh_haul_a.shape[0])
         wh_cap = wh_capacities[wh_id] # Warehouse capacity, each day new
         #d = dates[0]
-        d_ord = wh_ord[wh_ord['MAD'].dt.date == d]
-        # TODO: Check this calculation, find better way
-        d_ord.loc[:,'Gross total weight'] = d_ord['Balance Order Quantity']*d_ord['Net Weight']
-        d_ord.loc[:,'Total Volume'] = d_ord['Balance Order Quantity']*d_ord['Volume per tyre']*volume_scale
-        # Doda se odmah i lokacija, posle se iz d_ord samo uzimaju podaci, na osnovu razlicitih grupisanja
-        d_ord = add_ord_loc(d_ord,cust)
-        d_ord.loc[:,'loc'] = d_ord['party_country']+'-'+d_ord['party_zipcode'].str[:2]
-        # Merge backlog with new orders
-        d_ord = pd.concat([d_ord] + ord_backlog)
+        d_ord = unb_ord[(yday < unb_ord['MAD']) & (unb_ord['MAD']<= tday)] # Maybe need one day buffer after the MAD? (is MAD when tires arrive or when are ready to move?)
+        if d_ord.empty:
+            # If no new orders for this day
+            d_ord = pd.concat(ord_backlog)
+        else:
+            # TODO: Check this calculation, find better way
+            d_ord.loc[:,'Gross total weight'] = d_ord['Balance Order Quantity']*d_ord['Net Weight']
+            d_ord.loc[:,'Total Volume'] = d_ord['Balance Order Quantity']*d_ord['Volume per tyre']*volume_scale
+            # Doda se odmah i lokacija, posle se iz d_ord samo uzimaju podaci, na osnovu razlicitih grupisanja
+            d_ord = add_ord_loc(d_ord,cust)
+            d_ord.loc[:,'loc'] = d_ord['party_country']+'-'+d_ord['party_zipcode'].str[:2]
+            # Merge backlog with new orders
+            d_ord = pd.concat([d_ord] + ord_backlog)
         # Check which ords from backlog need to be dropped NOW
         drop = d_ord[ tday >= d_ord['DD'] -  drp_thr] # drop orders <2days left
         dropped.append(drop)
@@ -124,13 +134,14 @@ def wh_pack_orders(wh_id, orders):
                 c_haul = wh_haul_a[wh_haul_a['regionCodeTo']==haul_loc]
                 if c_haul.empty:
                     # If no hauliers for this customer, add to backlog
-                    print('No hauliers for this customer')
+                    print(f'No hauliers for this customer: {haul_loc}')
                     orders_left.append(d_ord_c)
                     continue
                 c_haul = c_haul.sort_values('Price')
                 # Book orders, and return booked orders and trucks, and left orders and trucks, split orders and warehouse capacity
                 d_ord_t, d_ord_b, d_ord_rem_o, wh_cap = fill_trucks_customer(d_ord_c, c_haul, wh_cap, d)
                 b_ord+=d_ord_b
+                unb_ord = unb_ord[~unb_ord.index.isin([o['order'] for o in d_ord_b])]
                 b_truck+=d_ord_t
                 # Remove booked hauliers from available hauliers
                 booked_h = [t['truck'] for t in d_ord_t]
@@ -173,7 +184,7 @@ def wh_pack_orders(wh_id, orders):
                 # Pull wh_hauliers for this location by desitnation, and start filling trucks from lowest price
                 l_haul = wh_haul[wh_haul['regionCodeTo']==l.upper()]
                 if l_haul.empty:
-                    print('No hauliers for this location')
+                    print(f'No hauliers for this location: {l}')
                     # If no hauliers for this location, add to backlog
                     orders_left.append(d_ord_left_xl_l)
                     continue
@@ -181,6 +192,7 @@ def wh_pack_orders(wh_id, orders):
                 # Book orders, and return booked orders and trucks, and left orders and trucks, split orders and warehouse capacity
                 d_ord_t, d_ord_b, d_ord_rem_o, wh_cap = fill_trucks_customer(d_ord_left_xl_l, l_haul, wh_cap, d)
                 b_ord+=d_ord_b
+                unb_ord = unb_ord[~unb_ord.index.isin([o['order'] for o in d_ord_b])]
                 b_truck+=d_ord_t
                 # Remove booked hauliers from available hauliers
                 booked_h = [t['truck'] for t in d_ord_t]
@@ -215,12 +227,13 @@ def wh_pack_orders(wh_id, orders):
                 ord_cntry_cnt = ord_cntry.loc[ord_cntry['party_country']==cnt]
                 if wh_cap==0:
                     # If no more wh capacity
+                    print('No more wh capacity')
                     ord_backlog.append(ord_cntry_cnt)
                     continue
                 # Pull wh_hauliers for this country
                 cnt_haul = wh_haul_a.loc[wh_haul_a['Ship To Country']==cnt]
                 if cnt_haul.empty:
-                    print('No hauliers for this country')
+                    print(f'No hauliers for this country: {cnt}')
                     # If no hauliers for this location, add to backlog
                     ord_backlog.append(ord_cntry_cnt)
                     continue
